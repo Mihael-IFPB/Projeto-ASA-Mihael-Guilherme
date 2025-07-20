@@ -1,0 +1,479 @@
+---
+- name: Ajustes iniciais pra todas as VMs
+  hosts: all
+  become: yes
+
+  tasks:
+    - name: Atualizando pacotes do sistema
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Instalando serviço de horário (chrony)
+      apt:
+        name: chrony
+        state: present
+
+    - name: Apontando o chrony pro servidor brasileiro
+      lineinfile:
+        path: /etc/chrony/chrony.conf
+        regexp: '^pool '
+        line: 'pool pool.ntp.br iburst'
+        state: present
+
+    - name: Subindo o serviço do chrony
+      service:
+        name: chrony
+        state: started
+        enabled: yes
+
+    - name: Configurando fuso horário p/ra Recife
+      timezone:
+        name: America/Recife
+
+    - name: Criando grupo ifpb
+      group:
+        name: ifpb
+        state: present
+
+    - name: Criando usuários mihael e guilherme
+      user:
+        name: "{{ item }}"
+        groups: ifpb
+        append: yes
+        shell: /bin/bash
+        state: present
+      loop:
+        - "mihael"
+        - "guilherme"
+
+    - name: Preparando pasta .ssh dos usuários
+      file:
+        path: "/home/{{ item }}/.ssh"
+        state: directory
+        owner: "{{ item }}"
+        group: "{{ item }}"
+        mode: '0700'
+      loop:
+        - "mihael"
+        - "guilherme"
+
+    - name: Gerando chave SSH pros usuários
+      openssh_keypair:
+        path: "/home/{{ item }}/.ssh/id_rsa"
+        owner: "{{ item }}"
+        group: "{{ item }}"
+        mode: '0600'
+      loop:
+        - "mihael"
+        - "guilherme"
+
+    - name: Liberando acesso com chave pública
+      copy:
+        src: "/home/{{ item }}/.ssh/id_rsa.pub"
+        dest: "/home/{{ item }}/.ssh/authorized_keys"
+        remote_src: yes
+        owner: "{{ item }}"
+        group: "{{ item }}"
+        mode: '0600'
+      loop:
+        - "mihael"
+        - "guilherme"
+
+    - name: Aviso legal antes do login via SSH
+      copy:
+        dest: /etc/issue.net
+        content: |
+          Acesso apenas para pessoas com autorização expressa.
+          Seu acesso está sendo monitorado !!!
+
+    - name: Configurando banner no SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Banner'
+        line: 'Banner /etc/issue.net'
+
+    - name: Endurecendo as regras de SSH
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        block: |
+          PermitRootLogin no
+          PasswordAuthentication no
+          AllowGroups vagrant ifpb
+
+    - name: Reiniciando SSH pra aplicar configs
+      service:
+        name: ssh
+        state: restarted
+
+    - name: Instalando cliente NFS
+      apt:
+        name: nfs-common
+        state: present
+
+    - name: Permitindo sudo para o grupo ifpb
+      lineinfile:
+        path: /etc/sudoers
+        regexp: '^%ifpb'
+        line: '%ifpb ALL=(ALL:ALL) ALL'
+        validate: '/usr/sbin/visudo -cf %s'
+
+- name: Servidor arq - configurando DHCP
+  hosts: arq
+  become: yes
+
+  vars:
+    db_mac: "AA:BB:CC:DD:EE:01"
+    app_mac: "AA:BB:CC:DD:EE:02"
+
+  tasks:
+    - name: Instalando DHCP server
+      apt:
+        name: isc-dhcp-server
+        state: present
+        update_cache: yes
+
+    - name: Definindo interface do DHCP (eth1)
+      lineinfile:
+        path: /etc/default/isc-dhcp-server
+        regexp: '^INTERFACESv4='
+        line: 'INTERFACESv4="eth1"'
+
+    - name: Pegando UID do root
+      command: id -u root
+      register: root_uid
+      changed_when: false
+
+    - name: Pegando GID do root
+      command: id -g root
+      register: root_gid
+      changed_when: false
+
+    - name: Criando arquivo de config do DHCP
+      copy:
+        dest: /etc/dhcp/dhcpd.conf
+        content: |
+          authoritative;
+
+          option domain-name "mihael.guilherme.devops";
+          option domain-name-servers 1.1.1.1, 8.8.8.8;
+          default-lease-time 600;
+          max-lease-time 7200;
+
+          subnet 192.168.56.0 netmask 255.255.255.0 {
+            range 192.168.56.50 192.168.56.100;
+            option routers 192.168.56.1;
+          }
+
+          host db {
+            hardware ethernet {{ db_mac }};
+            fixed-address 192.168.56.126;
+          }
+
+          host app {
+            hardware ethernet {{ app_mac }};
+            fixed-address 192.168.56.38;
+          }
+
+    - name: Reiniciando DHCP
+      service:
+        name: isc-dhcp-server
+        state: restarted
+        enabled: yes
+
+
+- name: Servidor arq - montando disco com LVM
+  hosts: arq
+  become: yes
+
+  vars:
+    vg_name: dados
+    lv_name: ifpb
+    lv_size: 15G
+    mount_point: /dados
+
+  tasks:
+    - name: Instalando LVM e parted
+      apt:
+        name:
+          - lvm2
+          - parted
+        state: present
+        update_cache: yes
+
+    - name: Criando partições nos discos extras
+      parted:
+        device: "/dev/{{ item }}"
+        number: 1
+        state: present
+        part_type: primary
+        fs_type: ext4
+        resize: yes
+      loop:
+        - sdb
+        - sdc
+        - sdd
+
+    - name: Inicializando os discos pro LVM
+      command: pvcreate /dev/{{ item }}1
+      loop:
+        - sdb
+        - sdc
+        - sdd
+      args:
+        creates: "/dev/{{ item }}1"
+
+    - name: Criando volume group "dados"
+      command: vgcreate {{ vg_name }} /dev/sdb1 /dev/sdc1 /dev/sdd1
+      args:
+        creates: "/dev/{{ vg_name }}"
+
+    - name: Criando logical volume "ifpb"
+      command: lvcreate -L {{ lv_size }} -n {{ lv_name }} {{ vg_name }}
+      args:
+        creates: "/dev/{{ vg_name }}/{{ lv_name }}"
+
+    - name: Formatando com ext4
+      filesystem:
+        fstype: ext4
+        dev: "/dev/{{ vg_name }}/{{ lv_name }}"
+
+    - name: Criando pasta de montagem /dados
+      file:
+        path: "{{ mount_point }}"
+        state: directory
+
+    - name: Montando no /etc/fstab
+      mount:
+        path: "{{ mount_point }}"
+        src: "/dev/{{ vg_name }}/{{ lv_name }}"
+        fstype: ext4
+        opts: defaults
+        state: mounted
+
+
+- name: Servidor arq - exportando via NFS
+  hosts: arq
+  become: yes
+
+  vars:
+    nfs_user: nfs-ifpb
+    shared_dir: /dados/nfs
+    subnet: 192.168.56.0/24
+
+  tasks:
+    - name: Instalando servidor NFS
+      apt:
+        name: nfs-kernel-server
+        state: present
+        update_cache: yes
+
+    - name: Criando usuário exclusivo pro NFS
+      user:
+        name: "{{ nfs_user }}"
+        shell: /usr/sbin/nologin
+        create_home: yes
+        state: present
+
+    - name: Criando pasta compartilhada
+      file:
+        path: "{{ shared_dir }}"
+        state: directory
+        owner: "{{ nfs_user }}"
+        group: "{{ nfs_user }}"
+        mode: '0750'
+
+    - name: Pegando UID do nfs-ifpb
+      command: id -u {{ nfs_user }}
+      register: uid
+      changed_when: false
+
+    - name: Pegando GID do nfs-ifpb
+      command: id -g {{ nfs_user }}
+      register: gid
+      changed_when: false
+
+    - name: Salvando UID/GID pra exportar corretamente
+      set_fact:
+        nfs_uid: "{{ uid.stdout }}"
+        nfs_gid: "{{ gid.stdout }}"
+
+    - name: Configurando /etc/exports
+      copy:
+        dest: /etc/exports
+        content: |
+          {{ shared_dir }} {{ subnet }}(rw,sync,no_subtree_check,all_squash,anonuid={{ nfs_uid }},anongid={{ nfs_gid }})
+      notify: Restart NFS
+
+  handlers:
+    - name: Restart NFS
+      service:
+        name: nfs-kernel-server
+        state: restarted
+        enabled: yes
+
+
+- name: Servidor db - banco de dados e NFS
+  hosts: db
+  become: yes
+
+  vars:
+    mount_point: /var/nfs
+    remote_share: 192.168.56.112:/dados/nfs
+
+  tasks:
+    - name: Instalando MariaDB
+      apt:
+        name: mariadb-server
+        state: present
+        update_cache: yes
+
+    - name: Instalando autofs
+      apt:
+        name: autofs
+        state: present
+
+    - name: Configurando autofs pro NFS
+      blockinfile:
+        path: /etc/auto.master
+        block: |
+          {{ mount_point }} /etc/auto.nfs --ghost
+
+    - name: Criando arquivo do autofs
+      copy:
+        dest: /etc/auto.nfs
+        content: |
+          share -rw,soft,intr {{ remote_share }}
+
+    - name: Criando ponto de montagem
+      file:
+        path: "{{ mount_point }}"
+        state: directory
+
+    - name: Reiniciando autofs
+      service:
+        name: autofs
+        state: restarted
+        enabled: yes
+
+
+- name: Servidor app - apache e NFS
+  hosts: app
+  become: yes
+
+  vars:
+    mount_point: /var/nfs
+    remote_share: 192.168.56.112:/dados/nfs
+    index_content: |
+      <html>
+      <head><title>Projeto Adminstraçao Sistemas Abertos</title></head>
+      <body>
+        <p>Disciplina: Administração de Sistemas Abertos</p>
+        <p>Integrantes:</p>
+        <ul>
+          <li>Mihael Reinaldo - Matrícula: 20232380012</li>
+          <li>Guilherme Manoel - Matrícula: 20232380026</li>
+        </ul>
+      </body>
+      </html>
+
+  tasks:
+    - name: Instalando Apache
+      apt:
+        name: apache2
+        state: present
+        update_cache: yes
+
+    - name: Substituindo index.html padrão
+      copy:
+        dest: /var/www/html/index.html
+        content: "{{ index_content }}"
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Instalando autofs
+      apt:
+        name: autofs
+        state: present
+
+    - name: Configurando autofs pro NFS
+      blockinfile:
+        path: /etc/auto.master
+        block: |
+          {{ mount_point }} /etc/auto.nfs --ghost
+
+    - name: Criando arquivo do autofs
+      copy:
+        dest: /etc/auto.nfs
+        content: |
+          share -rw,soft,intr {{ remote_share }}
+
+    - name: Criando ponto de montagem
+      file:
+        path: "{{ mount_point }}"
+        state: directory
+
+    - name: Reiniciando autofs
+      service:
+        name: autofs
+        state: restarted
+        enabled: yes
+
+
+- name: Cliente cli - X11 e NFS
+  hosts: cli
+  become: yes
+
+  vars:
+    mount_point: /var/nfs
+    remote_share: 192.168.56.112:/dados/nfs
+
+  tasks:
+    - name: Instalando Firefox e xauth
+      apt:
+        name:
+          - firefox-esr
+          - xauth
+        state: present
+        update_cache: yes
+
+    - name: Ativando encaminhamento X11 no SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?X11Forwarding'
+        line: 'X11Forwarding yes'
+
+    - name: Reiniciando SSH
+      service:
+        name: ssh
+        state: restarted
+
+    - name: Instalando autofs
+      apt:
+        name: autofs
+        state: present
+
+    - name: Configurando autofs pro NFS
+      blockinfile:
+        path: /etc/auto.master
+        block: |
+          {{ mount_point }} /etc/auto.nfs --ghost
+
+    - name: Criando arquivo do autofs
+      copy:
+        dest: /etc/auto.nfs
+        content: |
+          share -rw,soft,intr {{ remote_share }}
+
+    - name: Criando ponto de montagem
+      file:
+        path: "{{ mount_point }}"
+        state: directory
+
+    - name: Reiniciando autofs
+      service:
+        name: autofs
+        state: restarted
+        enabled: yes
+
