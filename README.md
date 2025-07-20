@@ -52,8 +52,8 @@ Siga os passos abaixo para executar o ambiente em sua máquina local:
 ### 1. Clone o repositório:
 
 ```bash
-git clone https://github.com/usuario/repositorio-projeto.git
-cd repositorio-projeto
+git clone https://github.com/Mihael-IFPB/Projeto-ASA-Mihael-Guilherme.git
+cd Projeto-ASA-Mihael-Guilherme
 
 ### 2. Desative o DHCP padrão do VirtualBox:
 
